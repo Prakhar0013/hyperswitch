@@ -1,46 +1,46 @@
+# --- Stage 1: The Builder ---
 FROM rust:bookworm as builder
 
 ARG EXTRA_FEATURES=""
 ARG VERSION_FEATURE_SET="v1"
 
+# Combine RUN layers and clean up apt cache to reduce image size
 RUN apt-get update \
-    && apt-get install -y libpq-dev libssl-dev pkg-config protobuf-compiler
+    && apt-get install -y --no-install-recommends libpq-dev libssl-dev pkg-config protobuf-compiler \
+    && rm -rf /var/lib/apt/lists/* # <-- CHANGE: Clean up apt cache
 
-# Copying codebase from current dir to /router dir
-# and creating a fresh build
 WORKDIR /router
 
-# Disable incremental compilation.
-#
-# Incremental compilation is useful as part of an edit-build-test-edit cycle,
-# as it lets the compiler avoid recompiling code that hasn't changed. However,
-# on CI, we're not making small edits; we're almost always building the entire
-# project from scratch. Thus, incremental compilation on CI actually
-# introduces *additional* overhead to support making future builds
-# faster...but no future builds will ever occur in any given CI environment.
-#
-# See https://matklad.github.io/2021/09/04/fast-rust-builds.html#ci-workflow
-# for details.
+# Set CI environment variables
 ENV CARGO_INCREMENTAL=0
-# Allow more retries for network requests in cargo (downloading crates) and
-# rustup (installing toolchains). This should help to reduce flaky CI failures
-# from transient network timeouts or other issues.
 ENV CARGO_NET_RETRY=10
 ENV RUSTUP_MAX_RETRIES=10
-# Don't emit giant backtraces in the CI logs.
 ENV RUST_BACKTRACE="short"
 
+# <-- CHANGE: Optimize layer caching for dependencies -->
+# Copy only dependency manifests
+COPY Cargo.toml Cargo.lock ./
+# If you have a .cargo/config.toml, copy it as well
+# COPY .cargo .cargo
+
+# Build only the dependencies to create a cached layer
+RUN mkdir src && echo "fn main() {println!(\"if you see this, the build broke\")}" > src/main.rs
+RUN cargo build --release --locked
+
+# Now, copy the full source code
 COPY . .
-RUN cargo build \
-    --release \
+
+# Finally, build the actual application, which will be much faster
+# as dependencies are already built and cached.
+RUN cargo build --release --locked \ # <-- CHANGE: Build in release mode
+    -j 1 \ # The -j flag is less critical for a cached build, but fine to keep
     --no-default-features \
-    --features release \
     --features ${VERSION_FEATURE_SET} \
     ${EXTRA_FEATURES}
 
 
-
-FROM debian:bookworm
+# --- Stage 2: The Runner ---
+FROM debian:bookworm-slim # <-- CHANGE: Use a smaller base image
 
 # Placing config and binary executable in different directories
 ARG CONFIG_DIR=/local/config
@@ -52,15 +52,14 @@ COPY --from=builder /router/config/payment_required_fields_v2.toml ${CONFIG_DIR}
 # RUN_ENV decides the corresponding config file to be used
 ARG RUN_ENV=sandbox
 
-# args for deciding the executable to export. three binaries:
-# 1. BINARY=router - for main application
-# 2. BINARY=scheduler, SCHEDULER_FLOW=consumer - part of process tracker
-# 3. BINARY=scheduler, SCHEDULER_FLOW=producer - part of process tracker
+# args for deciding the executable to export
 ARG BINARY=router
 ARG SCHEDULER_FLOW=consumer
 
+# <-- CHANGE: Combine RUN layers, use runtime libs, and clean up -->
 RUN apt-get update \
-    && apt-get install -y ca-certificates tzdata libpq-dev curl procps
+    && apt-get install -y --no-install-recommends ca-certificates tzdata libpq5 curl procps \
+    && rm -rf /var/lib/apt/lists/*
 
 EXPOSE 8080
 
@@ -73,6 +72,7 @@ ENV TZ=Etc/UTC \
 
 RUN mkdir -p ${BIN_DIR}
 
+# <-- CHANGE: Copy the optimized RELEASE binary -->
 COPY --from=builder /router/target/release/${BINARY} ${BIN_DIR}/${BINARY}
 
 # Create the 'app' user and group
